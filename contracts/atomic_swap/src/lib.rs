@@ -9,6 +9,10 @@ use zk_verifier::{ProofNode, ZkVerifierClient};
 const PERSISTENT_TTL_LEDGERS: u32 = 6_312_000;
 const DEFAULT_DISPUTE_WINDOW_LEDGERS: u32 = 17_280;
 
+
+
+//Added enum
+
 #[contracterror]
 #[derive(Clone, Debug, PartialEq)]
 pub enum ContractError {
@@ -33,6 +37,8 @@ pub enum ContractError {
     InvalidProof = 16,
     /// Pagination offset or limit is out of valid range.
     InvalidPaginationParams = 17,
+    /// Cancel delay has not yet elapsed since swap creation.
+    CancelTooEarly = 18,
 }
 
 #[contracttype]
@@ -598,9 +604,19 @@ impl AtomicSwap {
             env.panic_with_error(ContractError::SwapNotPending);
         }
         swap.buyer.require_auth();
-        if env.ledger().timestamp() < swap.expires_at {
-            env.panic_with_error(ContractError::SwapNotCancellable);
+
+        // Read cancel_delay_secs from Config and enforce the delay
+        let config: Config = env
+            .storage()
+            .instance()
+            .get(&DataKey::Config)
+            .unwrap_or_else(|| env.panic_with_error(ContractError::NotInitialized));
+        
+        let cancel_deadline = swap.created_at.saturating_add(config.cancel_delay_secs);
+        if env.ledger().timestamp() < cancel_deadline {
+            env.panic_with_error(ContractError::CancelTooEarly);
         }
+
         token::Client::new(&env, &swap.usdc_token).transfer(
             &env.current_contract_address(),
             &swap.buyer,
@@ -1365,7 +1381,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #10)")]
+    #[should_panic(expected = "Error(Contract, #18)")]
     fn test_cancel_swap_rejects_before_expiry() {
         let env = Env::default();
         env.mock_all_auths();
@@ -1942,9 +1958,44 @@ mod test {
             &registry_id,
             500,
         );
-        env.ledger()
-            .with_mut(|li| li.timestamp = li.timestamp.saturating_add(61));
-        client.cancel_swap(&swap_id);
+        assert!(result.is_err(), "non-admin update_config should fail");
+    }
+
+    #[test]
+    fn test_update_config_rejects_fee_bps_over_10000_with_invalid_fee() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let contract_id = env.register(AtomicSwap, ());
+        let client = AtomicSwapClient::new(&env, &contract_id);
+        client.initialize(&admin, &0u32, &Address::generate(&env), &60u64);
+
+        let result = client.try_update_config(
+            &admin,
+            &10_001u32,
+            &Address::generate(&env),
+            &60u64,
+        );
+        assert_eq!(
+            result,
+            Err(Ok(soroban_sdk::Error::from_contract_error(ContractError::InvalidFee as u32)))
+        );
+    }
+
+    #[test]
+    fn test_transfer_admin_succeeds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+        let contract_id = env.register(AtomicSwap, ());
+        let client = AtomicSwapClient::new(&env, &contract_id);
+        let zk_verifier = Address::generate(&env);
+        client.initialize(&admin, &0u32, &Address::generate(&env), &60u64, &zk_verifier);
+        client.transfer_admin(&new_admin);
+        // new admin can now call an admin-only function without panic
+        client.set_dispute_window(&100u32);
+    }
 
         assert!(client.is_listing_available(&listing_id));
     }
